@@ -44,6 +44,13 @@
 
 시드 데이터는 `application.yml`의 `settlement.seed-data.enabled=true` 일 때 `SeedDataLoader`(`CommandLineRunner`)가 과제 §6.1 데이터 + 작업지시서 §6.2(검증표에서 역산한 취소 데이터)를 주입한다.
 
+### Swagger UI / OpenAPI
+
+- **Swagger UI**: http://localhost:8080/swagger-ui/index.html (클릭 한 번에 API 호출·검증 가능)
+- **OpenAPI 문서(JSON)**: http://localhost:8080/v3/api-docs
+
+`springdoc-openapi`로 자동 생성. 별도 어노테이션(`@Operation` 등)은 의도적으로 생략 — 자동 생성만으로 7개 엔드포인트와 DTO 스키마가 등록된다(과설계 방지).
+
 ---
 
 ## 요구사항 해석 및 가정
