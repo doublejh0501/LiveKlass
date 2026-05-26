@@ -7,6 +7,7 @@ import com.futurescholae.liveklass.settlement.domain.Creator;
 import com.futurescholae.liveklass.settlement.domain.SaleRecord;
 import com.futurescholae.liveklass.settlement.dto.ConfirmSettlementRequest;
 import com.futurescholae.liveklass.settlement.dto.RegisterCancellationRequest;
+import com.futurescholae.liveklass.settlement.dto.RegisterSaleRequest;
 import com.futurescholae.liveklass.settlement.repository.CancelRecordRepository;
 import com.futurescholae.liveklass.settlement.repository.CourseRepository;
 import com.futurescholae.liveklass.settlement.repository.CreatorRepository;
@@ -327,6 +328,96 @@ class SettlementIntegrationTest {
                         .param("to", "2025-03-31"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()", is(4)));
+    }
+
+    // ============================================================
+    // 추가 엣지케이스 (작업지시서 §7.2 완전 커버 + 입력 검증 보강)
+    // ============================================================
+
+    @Test
+    @DisplayName("[미래 월] 데이터 없는 미래 월 조회 → 200 + 모든 금액 0")
+    void should_return_zero_for_future_year_month() throws Exception {
+        mockMvc.perform(get("/api/creators/creator-1/settlements")
+                        .param("yearMonth", "2099-12"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.totalSalesAmount", is(0)))
+                .andExpect(jsonPath("$.totalRefundAmount", is(0)))
+                .andExpect(jsonPath("$.netSalesAmount", is(0)))
+                .andExpect(jsonPath("$.payoutAmount", is(0)))
+                .andExpect(jsonPath("$.saleCount", is(0)))
+                .andExpect(jsonPath("$.cancelCount", is(0)));
+    }
+
+    @Test
+    @DisplayName("[운영자 집계] to < from → 400 INVALID_DATE_RANGE")
+    void should_reject_admin_aggregate_when_to_before_from() throws Exception {
+        mockMvc.perform(get("/api/admin/settlements")
+                        .param("from", "2025-03-31")
+                        .param("to", "2025-03-01"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code", is("INVALID_DATE_RANGE")));
+    }
+
+    @Test
+    @DisplayName("[운영자 집계] 잘못된 날짜 형식 → 400 INVALID_REQUEST")
+    void should_reject_admin_aggregate_with_malformed_date() throws Exception {
+        mockMvc.perform(get("/api/admin/settlements")
+                        .param("from", "2025/03/01")
+                        .param("to", "2025-03-31"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code", is("INVALID_REQUEST")));
+    }
+
+    @Test
+    @DisplayName("[취소 등록] 존재하지 않는 saleId → 404 SALE_NOT_FOUND")
+    void should_reject_cancellation_when_sale_not_found() throws Exception {
+        RegisterCancellationRequest req = new RegisterCancellationRequest(
+                null, "sale-nonexistent", 10_000L,
+                OffsetDateTime.parse("2025-03-30T10:00:00+09:00"));
+        mockMvc.perform(post("/api/cancellations")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(req)))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code", is("SALE_NOT_FOUND")));
+    }
+
+    @Test
+    @DisplayName("[판매 등록] 존재하지 않는 courseId → 404 COURSE_NOT_FOUND")
+    void should_reject_sale_when_course_not_found() throws Exception {
+        RegisterSaleRequest req = new RegisterSaleRequest(
+                null, "course-nonexistent", "student-z", 10_000L,
+                OffsetDateTime.parse("2025-03-30T10:00:00+09:00"));
+        mockMvc.perform(post("/api/sales")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(req)))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code", is("COURSE_NOT_FOUND")));
+    }
+
+    @Test
+    @DisplayName("[입력 검증] amount=0 으로 판매 등록 → 400 INVALID_REQUEST (@Positive)")
+    void should_reject_sale_with_non_positive_amount() throws Exception {
+        RegisterSaleRequest req = new RegisterSaleRequest(
+                null, "course-1", "student-z", 0L,
+                OffsetDateTime.parse("2025-03-30T10:00:00+09:00"));
+        mockMvc.perform(post("/api/sales")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(req)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code", is("INVALID_REQUEST")));
+    }
+
+    @Test
+    @DisplayName("[입력 검증] refundAmount=0 으로 취소 등록 → 400 INVALID_REQUEST (@Positive)")
+    void should_reject_cancellation_with_non_positive_refund_amount() throws Exception {
+        RegisterCancellationRequest req = new RegisterCancellationRequest(
+                null, "sale-1", 0L,
+                OffsetDateTime.parse("2025-03-30T10:00:00+09:00"));
+        mockMvc.perform(post("/api/cancellations")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(req)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code", is("INVALID_REQUEST")));
     }
 
     private static SaleRecord sale(String id, String courseId, String studentId, long amount, String iso) {
