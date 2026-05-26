@@ -260,24 +260,72 @@ curl -X POST http://localhost:8080/api/admin/settlements/confirm \
 
 ## 데이터 모델 설명
 
+### ERD (관계도)
+
 ```
 Creator (id PK, name)
    ↑ creator_id (FK 정규화 유지)
-Course (id PK, creatorId, title)
+Course (id PK, creator_id, title)
    ↑ course_id
-SaleRecord (id PK, courseId, studentId, amount: long, paidAt: Instant UTC)
+SaleRecord (id PK, course_id, student_id, amount, paid_at)
    ↑ sale_id
-CancelRecord (id PK, saleId, refundAmount: long, cancelledAt: Instant UTC)
+CancelRecord (id PK, sale_id, refund_amount, cancelled_at)
 
-SettlementSnapshot (id PK, creatorId, periodYearMonth, status, settledAmount, confirmedAt, paidAt)
+SettlementSnapshot (id PK, creator_id, period_year_month, status,
+                    settled_amount, confirmed_at, paid_at)
    UNIQUE(creator_id, period_year_month)   ← 동일 기간 중복 정산 방지
 ```
 
-설계 메모:
-- `creatorId` 는 `SaleRecord`에 비정규화하지 않고 `Course`를 join 으로 도출(§설계 결정 4).
-- 인덱스: `idx_course_creator(creator_id)`, `idx_sale_course(course_id)`, `idx_sale_paid_at(paid_at)`, `idx_cancel_sale(sale_id)`, `idx_cancel_cancelled_at(cancelled_at)`.
-- 시각은 모두 `Instant` (UTC).
-- 금액은 모두 `long` (KRW, 원 단위).
+### 테이블 컬럼 상세
+
+**`creators`** — 크리에이터(강사) 마스터
+| 컬럼 | 타입 | NULL | 제약 / 인덱스 | 설명 |
+|---|---|---|---|---|
+| `id` | VARCHAR | NOT NULL | **PK** | 크리에이터 ID (예: `creator-1`) |
+| `name` | VARCHAR | NULL | | 크리에이터 이름 |
+
+**`courses`** — 강의 마스터
+| 컬럼 | 타입 | NULL | 제약 / 인덱스 | 설명 |
+|---|---|---|---|---|
+| `id` | VARCHAR | NOT NULL | **PK** | 강의 ID (예: `course-1`) |
+| `creator_id` | VARCHAR | NOT NULL | `idx_course_creator` | 소유 크리에이터 (논리 FK → `creators.id`) |
+| `title` | VARCHAR | NULL | | 강의 제목 |
+
+**`sale_records`** — 판매 내역
+| 컬럼 | 타입 | NULL | 제약 / 인덱스 | 설명 |
+|---|---|---|---|---|
+| `id` | VARCHAR | NOT NULL | **PK** | 판매 ID |
+| `course_id` | VARCHAR | NOT NULL | `idx_sale_course` | 강의 ID (논리 FK → `courses.id`) |
+| `student_id` | VARCHAR | NOT NULL | | 수강생 ID (단순 데이터 필드, 호출 주체 아님) |
+| `amount` | BIGINT (`long`) | NOT NULL | `> 0` (DTO `@Positive`) | 결제 금액 (KRW 원 단위) |
+| `paid_at` | TIMESTAMP (`Instant` UTC) | NOT NULL | `idx_sale_paid_at` | 결제 완료 일시 (UTC 저장 / KST 변환 계산) |
+
+**`cancel_records`** — 취소(환불) 내역
+| 컬럼 | 타입 | NULL | 제약 / 인덱스 | 설명 |
+|---|---|---|---|---|
+| `id` | VARCHAR | NOT NULL | **PK** | 취소 ID |
+| `sale_id` | VARCHAR | NOT NULL | `idx_cancel_sale` | 원본 판매 ID (논리 FK → `sale_records.id`) |
+| `refund_amount` | BIGINT (`long`) | NOT NULL | `> 0` + 누적 ≤ 원결제(서비스 검증) | 환불 금액 |
+| `cancelled_at` | TIMESTAMP (`Instant` UTC) | NOT NULL | `idx_cancel_cancelled_at` | 취소 일시 |
+
+**`settlement_snapshots`** — 정산 확정 스냅샷 (가산점)
+| 컬럼 | 타입 | NULL | 제약 / 인덱스 | 설명 |
+|---|---|---|---|---|
+| `id` | BIGINT | NOT NULL | **PK** (IDENTITY) | 스냅샷 ID |
+| `creator_id` | VARCHAR | NOT NULL | **UNIQUE**(creator_id, period_year_month) | 정산 대상 크리에이터 |
+| `period_year_month` | VARCHAR(7) | NOT NULL | 〃 | 정산 월 (예: `2025-03`) |
+| `status` | VARCHAR(16) | NOT NULL | ENUM | `PENDING` / `CONFIRMED` / `PAID` |
+| `settled_amount` | BIGINT | NOT NULL | | 확정 시점의 정산 예정 금액 |
+| `confirmed_at` | TIMESTAMP | NULL | | 확정 일시 |
+| `paid_at` | TIMESTAMP | NULL | | 지급 일시 |
+
+### 설계 메모
+
+- **정규화 유지**: `creator_id` 는 `sale_records`에 비정규화하지 않고 `courses`를 join으로 도출(§설계 결정 4). 과제 규모에서 join 비용은 무시 가능하며, 비정규화는 중복 컬럼 정합성 부담만 늘림.
+- **시각**: 모두 `Instant` (UTC) 저장 → 월 경계 계산만 `Asia/Seoul` 변환. `LocalDateTime` 금지(오프셋 손실).
+- **금액**: 모두 `long` (KRW, 원 단위). `BigDecimal` 미사용(소수점 통화가 아님).
+- **FK**: JPA 엔티티 관계는 매핑하지 않고 ID로만 연결(**논리 FK**). 과제 규모와 H2 in-memory 환경에서 join 쿼리는 JPQL로 명시. (실서비스라면 `@ManyToOne` + lazy loading + FK 제약 추가 검토.)
+- **인덱스**: 5개 — 모두 조회 패턴(기간 필터 + creator/course/sale join)에서 실제로 사용됨.
 
 ---
 
@@ -321,27 +369,35 @@ DB 의존 없이 정산 정책 전체를 증명.
 
 ---
 
-## 추가한 테스트 케이스와 그 이유
+## 추가한 엣지케이스 — 위험 → 대처 증명
 
-과제 요구서의 "추가 데이터 가이드"(어떤 케이스를 추가했는지·왜 추가했는지)에 따라 다음을 직접 등록·검증했다:
+과제 요구서의 "추가 데이터 가이드"는 본질적으로 **"오류·엣지 시나리오에 대한 데이터를 직접 셋업하고, 안전하게 대처됨을 증명하라"**는 요구다. 시드 데이터를 늘리는 게 아니라 **각 시나리오의 데이터를 테스트 픽스처로 셋업 → 응답을 assert** 하는 방식으로 12개 케이스를 박았다.
 
-**도메인 규칙 검증**
-1. **음수 정산 월** — 환불만 있는 달이 실제로 발생할 수 있는 시나리오(샘플 데이터의 cancel-3). 정책(수수료 비환불 / 클램프)을 코드로 증명.
-2. **월 경계 정밀도** — `23:59:59` 닫힘 비교가 아닌 반열린 구간이 정확함을 증명.
-3. **타임존 함정** — UTC 입력이 KST 기준 다른 달로 넘어가는 경우(`2025-03-31T16:00:00Z` → KST 4월 1일 01:00 → 4월 귀속).
-4. **누적 환불 초과** — 1차 환불 OK → 2차 시도가 누적으로 초과 → 422. 실서비스 정산 사고에서 가장 흔한 패턴 방어.
-5. **부분 환불 단일 초과** — 단일 환불액이 원결제 초과 → 422.
+### 도메인 규칙 검증 (5)
 
-**입력 검증 / 형식 오류**
-6. **잘못된 연월 형식 (3종)** — `2025-13` / `2025/03` / `25-3` 모두 strict 파싱으로 400. 정규식이 아닌 `DateTimeFormatter` strict 모드 사용.
-7. **미래 월 조회** — 데이터 없는 미래 월(`2099-12`)도 빈 월 정책(200 + 모든 금액 0)으로 일관 처리됨을 증명. 빈 월/미래 월/존재하지 않는 크리에이터 모두 같은 응답.
-8. **운영자 집계 `to < from`** — 400 `INVALID_DATE_RANGE`. 운영자 입력 실수 방어.
-9. **운영자 집계 잘못된 날짜 형식** — `2025/03/01` 등 ISO date 위반 → 400 `INVALID_REQUEST`.
-10. **존재하지 않는 saleId 로 취소** — 404 `SALE_NOT_FOUND`. 무결성 사전 검증.
-11. **존재하지 않는 courseId 로 판매** — 404 `COURSE_NOT_FOUND`. FK 무결성을 서비스에서 명시적 검증.
-12. **amount/refundAmount ≤ 0** — DTO `@Positive` 검증 실패 → 400 `INVALID_REQUEST`. 음수/0 결제·환불 거부.
+| # | 시나리오 데이터 | 안 막으면 발생하는 위험 | 실제 대처 (검증된 응답) |
+|---|---|---|---|
+| 1 | 환불만 있는 월 (sale 0건 + cancel 60,000) | 음수 net 에 비례 수수료 환원 → 플랫폼 손실 / 음수→0 클램프 시 환불액 증발 | `net=-60,000 / commission=0 / payout=-60,000` (비환불 정책) |
+| 2 | `2025-03-31T23:59:59+09:00` + `2025-04-01T00:00:00+09:00` 결제 | 닫힘 비교 시 3월 마지막 1초 누락 → 정산 1원 오차 | 반열린 구간으로 3월에 23:59:59 포함, 4월에 00:00:00 포함 |
+| 3 | `2025-03-31T16:00:00Z`(UTC) 결제 | 서버 타임존 따라 다른 달로 새어나감 | KST 변환 후 4월(KST 4/1 01:00)에 정확 귀속 |
+| 4 | 50,000 결제 → 50,000 환불(OK) → 추가 1원 환불 시도 | 음수 잔액 / 회계 사고 | 422 `REFUND_EXCEEDS_PAYMENT` (누적 51,000 > 50,000) |
+| 5 | 원결제 50,000 → 단일 환불 50,001 시도 | 음수 잔액 | 422 `REFUND_EXCEEDS_PAYMENT` |
 
-목적: **요구서가 "어떤 케이스를 추가했는지·왜 추가했는지"를 가산점 포인트로 명시**했기 때문에, 도메인 규칙 검증과 입력 검증을 분리해서 빠짐없이 박았다.
+### 입력 검증 / 형식 오류 (7)
+
+| # | 시나리오 데이터 | 안 막으면 발생하는 위험 | 실제 대처 (검증된 응답) |
+|---|---|---|---|
+| 6 | `2025-13` / `2025/03` / `25-3` | 파싱 에러 500 새어나감 / 무효 월이 0월·13월로 흘러감 | 400 `INVALID_YEAR_MONTH` (`DateTimeFormatter` strict) |
+| 7 | `2099-12` 미래 월 조회 | 404 vs 0원 불일관 / 다른 빈 월과 다른 응답 | 200 + 모든 금액 0 (빈 월 정책 일관) |
+| 8 | 운영자 집계 `from=2025-03-31&to=2025-03-01` | 빈 결과 / SQL 무한 루프 / 운영자 혼란 | 400 `INVALID_DATE_RANGE` |
+| 9 | 운영자 집계 `from=2025/03/01` | 파싱 에러 500 새어나감 | 400 `INVALID_REQUEST` |
+| 10 | 존재하지 않는 `saleId` 로 취소 | NPE / FK 위반 / 환불 합산 깨짐 | 404 `SALE_NOT_FOUND` |
+| 11 | 존재하지 않는 `courseId` 로 판매 | 고아 레코드 / 정산 조회 시 join 깨짐 | 404 `COURSE_NOT_FOUND` |
+| 12 | `amount=0` 판매 / `refundAmount=0` 취소 | 0원/음수 결제·환불 누적 → 통계 오염 | 400 `INVALID_REQUEST` (DTO `@Positive`) |
+
+**증거**: 위 12개 모두 `SettlementIntegrationTest` 의 개별 `@Test` 로 데이터 셋업 + 응답 assert. `should_apply_half_open_interval_at_month_boundary`, `should_reject_when_cumulative_refund_exceeds_payment` 등 의도가 보이는 네이밍.
+
+**왜 시드 데이터에 추가하지 않았는가**: 시드는 검증표(creator-1 / 2025-03 = 120,000)의 일관성 데모용. 엣지 시나리오 데이터를 섞으면 시연 동선이 어지러워진다. 엣지케이스 데이터는 테스트 내부에서만 격리해 주입.
 
 ---
 
